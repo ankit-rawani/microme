@@ -1,0 +1,24 @@
+# Tokenized data shards & loss masks (regenerable via data/prepare_*.py — huge)
+*.bin
+*.mask
+data/tinystories/
+data/fineweb_edu/
+data/smoltalk/
+data/dolly/
+data/mix/
+data/identity/
+
+# Model checkpoints & run outputs (multi-GB). Keep the loss-curve PNGs in runs/.
+*.pt
+runs/*/
+
+# HuggingFace export bundle (weights live on the Hub)
+hf/
+
+# Logs, caches, envs
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
