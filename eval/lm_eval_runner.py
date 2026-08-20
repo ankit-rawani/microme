@@ -85,10 +85,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="runs/micro_125m_muon/ckpt.pt")
     ap.add_argument("--tokenizer", default="tokenizer/fineweb-bpe.json")
+    ap.add_argument("--preset", default="micro_125m")
     ap.add_argument("--tasks", default="arc_easy,hellaswag,piqa,lambada_openai")
     ap.add_argument("--limit", type=int)
     a = ap.parse_args()
-    lm = MicroMeLM(a.ckpt, a.tokenizer)
+    lm = MicroMeLM(a.ckpt, a.tokenizer, preset=a.preset)
     res = simple_evaluate(model=lm, tasks=a.tasks.split(","), limit=a.limit)
     print("\n===== RESULTS =====")
     for task, m in res["results"].items():

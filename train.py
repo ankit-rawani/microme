@@ -14,7 +14,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 
 import argparse
 import csv
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -86,6 +86,8 @@ class TrainConfig:
     eval_iters: int = 100
     ckpt_secs: int = 1800    # checkpoint every 30 min wall-clock (§2)
     seed: int = 1337
+    arch: dict = field(default_factory=dict)   # GPTConfig overrides for the ablation lab
+    tag: str = ""            # short label for REPORT/plots (e.g. "swiglu")
 
 
 # Per-preset run defaults (data/tokenizer + batch/schedule sized to the model).
@@ -95,6 +97,9 @@ RUN_DEFAULTS = {
                        batch=16, grad_accum=8, max_iters=8000, warmup=300, eval_every=250, eval_iters=100),
     "micro_125m": dict(data="data/fineweb_edu", tokenizer="tokenizer/fineweb-bpe.json",
                        batch=4, grad_accum=128, max_iters=5700, warmup=700, eval_every=500, eval_iters=40),
+    # capstone: 217M, tied embeddings + grad_ckpt (in preset), 2B tokens (~3815 iters)
+    "mini_220m":  dict(data="data/fineweb_edu", tokenizer="tokenizer/fineweb-bpe.json",
+                       batch=4, grad_accum=128, max_iters=3815, warmup=500, eval_every=500, eval_iters=40),
 }
 
 
@@ -166,7 +171,7 @@ def run(tc: TrainConfig):
     outdir.mkdir(parents=True, exist_ok=True)
     ckpt_path = outdir / "ckpt.pt"
 
-    cfg = PRESETS[tc.preset]
+    cfg = replace(PRESETS[tc.preset], **tc.arch)   # apply ablation-lab arch overrides
     tok = Tokenizer.from_file(str(ROOT / tc.tokenizer))
     bos = tok.token_to_id("<|bos|>")
     train_data = np.memmap(ROOT / tc.data / "train.bin", dtype=np.uint16, mode="r")
@@ -241,7 +246,8 @@ def run(tc: TrainConfig):
     csv_f.close()
     dt = time.time() - t0
     final_story = sample_story(raw_model, tok, device, bos)
-    log_report(f"- **{tc.preset} [{tc.optim} seed{tc.seed}]** ({datetime.now():%Y-%m-%d %H:%M}) | "
+    label = tc.tag or tc.optim
+    log_report(f"- **{tc.preset} [{label} seed{tc.seed}]** ({datetime.now():%Y-%m-%d %H:%M}) | "
                f"{raw_model.num_params()/1e6:.1f}M | {it+1} iters, {(it+1)*eff/1e6:.0f}M tok | "
                f"{dt/60:.1f} min | val_loss {best_val:.4f}\n  - sample: {final_story!r}")
     print(f"\ndone: {dt/60:.1f} min | best val_loss {best_val:.4f}")
@@ -257,6 +263,12 @@ if __name__ == "__main__":
     ap.add_argument("--max_iters", type=int)
     ap.add_argument("--batch", type=int)
     ap.add_argument("--grad_accum", type=int)
+    # ablation-lab arch knobs (override the preset)
+    ap.add_argument("--mlp", choices=["relu2", "swiglu"])
+    ap.add_argument("--tie", action="store_true")
+    ap.add_argument("--no_qk_norm", action="store_true")
+    ap.add_argument("--layer_reuse", type=int)
+    ap.add_argument("--tag")
     a = ap.parse_args()
     if a.cmd == "smoke":
         smoke()
@@ -264,7 +276,13 @@ if __name__ == "__main__":
         tc = TrainConfig(preset=a.preset, optim=a.optim)
         for k, v in RUN_DEFAULTS.get(a.preset, {}).items():
             setattr(tc, k, v)
-        tc.out = a.out or f"runs/{a.preset}_{a.optim}"
+        arch = {}
+        if a.mlp: arch["mlp"] = a.mlp
+        if a.tie: arch["tie_embeddings"] = True
+        if a.no_qk_norm: arch["qk_norm"] = False
+        if a.layer_reuse: arch["layer_reuse"] = a.layer_reuse
+        tc.arch, tc.tag = arch, (a.tag or a.optim)
+        tc.out = a.out or f"runs/{a.preset}_{tc.tag}"
         if a.seed is not None: tc.seed = a.seed
         if a.max_iters: tc.max_iters = a.max_iters
         if a.batch: tc.batch = a.batch

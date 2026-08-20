@@ -13,6 +13,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 
 @dataclass
@@ -24,6 +25,12 @@ class GPTConfig:
     ctx: int = 64
     softcap: float = 15.0
     rope_base: float = 10000.0
+    # --- ablation-lab knobs (defaults reproduce the shipped micro_* models) ---
+    mlp: str = "relu2"            # "relu2" | "swiglu"
+    tie_embeddings: bool = False  # share input/output embedding weights
+    qk_norm: bool = True          # RMSNorm on q,k before attention
+    layer_reuse: int = 1          # MobileLLM-style: apply each block N times (more depth, same params)
+    grad_ckpt: bool = False       # gradient/activation checkpointing (fit bigger models on 8GB)
 
     @property
     def head_dim(self) -> int:
@@ -38,6 +45,9 @@ PRESETS = {
     "micro_1m":   GPTConfig(vocab_size=512,   n_layer=4,  n_head=4,  d_model=128, ctx=64),
     "micro_30m":  GPTConfig(vocab_size=24576, n_layer=8,  n_head=7,  d_model=448, ctx=512),
     "micro_125m": GPTConfig(vocab_size=24576, n_layer=20, n_head=10, d_model=640, ctx=1024),
+    # capstone: deep-thin + tied embeddings (the 3-seed-confirmed lab winner) + gradient checkpointing
+    "mini_220m":  GPTConfig(vocab_size=24576, n_layer=28, n_head=12, d_model=768, ctx=1024,
+                            tie_embeddings=True, grad_ckpt=True),
 }
 
 
@@ -68,7 +78,7 @@ def apply_rope(x, cos, sin):
 class Attention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.nh, self.hd = cfg.n_head, cfg.head_dim
+        self.nh, self.hd, self.qk_norm = cfg.n_head, cfg.head_dim, cfg.qk_norm
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
 
@@ -78,7 +88,8 @@ class Attention(nn.Module):
         q = q.view(B, T, self.nh, self.hd).transpose(1, 2)
         k = k.view(B, T, self.nh, self.hd).transpose(1, 2)
         v = v.view(B, T, self.nh, self.hd).transpose(1, 2)
-        q, k = rmsnorm(q), rmsnorm(k)               # QK-norm (weightless)
+        if self.qk_norm:
+            q, k = rmsnorm(q), rmsnorm(k)           # QK-norm (weightless)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).reshape(B, T, C)
@@ -88,12 +99,21 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        hidden = 4 * cfg.d_model
-        self.fc = nn.Linear(cfg.d_model, hidden, bias=False)
-        self.proj = nn.Linear(hidden, cfg.d_model, bias=False)
+        d = cfg.d_model
+        self.kind = cfg.mlp
+        if self.kind == "swiglu":                    # gated; hidden sized to match ReLU²'s 8*d² params
+            h = max(32, int(round(8 * d / 3 / 32)) * 32)
+            self.gate = nn.Linear(d, h, bias=False)
+            self.up = nn.Linear(d, h, bias=False)
+            self.proj = nn.Linear(h, d, bias=False)
+        else:                                         # relu2: simpler, no gate
+            self.fc = nn.Linear(d, 4 * d, bias=False)
+            self.proj = nn.Linear(4 * d, d, bias=False)
 
     def forward(self, x):
-        return self.proj(F.relu(self.fc(x)) ** 2)   # ReLU^2, no gate
+        if self.kind == "swiglu":
+            return self.proj(F.silu(self.gate(x)) * self.up(x))
+        return self.proj(F.relu(self.fc(x)) ** 2)
 
 
 class Block(nn.Module):
@@ -130,6 +150,8 @@ class GPT(nn.Module):
         for blk in self.blocks:
             nn.init.zeros_(blk.attn.proj.weight)
             nn.init.zeros_(blk.mlp.proj.weight)
+        if cfg.tie_embeddings:
+            self.lm_head.weight = self.wte.weight    # share input/output embeddings
 
     def _init(self, m):
         if isinstance(m, (nn.Linear, nn.Embedding)):
@@ -142,8 +164,13 @@ class GPT(nn.Module):
         T = idx.size(1)
         assert T <= self.cfg.ctx, f"seq len {T} > ctx {self.cfg.ctx}"
         x = self.wte(idx)
+        ckpt = self.cfg.grad_ckpt and self.training
         for blk in self.blocks:
-            x = blk(x, self.cos, self.sin)
+            for _ in range(self.cfg.layer_reuse):    # MobileLLM immediate block reuse
+                if ckpt:                             # recompute activations in backward (saves VRAM)
+                    x = torch.utils.checkpoint.checkpoint(blk, x, self.cos, self.sin, use_reentrant=False)
+                else:
+                    x = blk(x, self.cos, self.sin)
         logits = self.lm_head(self.norm_f(x))
         cap = self.cfg.softcap
         logits = cap * torch.tanh(logits / cap)     # logit softcap
